@@ -1,9 +1,9 @@
 from .base import Adapter, LoadResult, NormalizedTxn
-from .bank_csv import BankCsvAdapter
+from .starone_csv import StaroneCsvAdapter
 from .tax_xlsx import TaxXlsxAdapter
 
 ADAPTERS: dict[str, Adapter] = {
-    BankCsvAdapter.name: BankCsvAdapter(),
+    StaroneCsvAdapter.name: StaroneCsvAdapter(),
     TaxXlsxAdapter.name: TaxXlsxAdapter(),
 }
 

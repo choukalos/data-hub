@@ -1,6 +1,7 @@
 -- 0001_init.sql — finance schema v1
 -- Applied by the data-hub migration runner (tracked in finance.schema_migrations).
--- Convention: no semicolons inside string literals (runner splits on ';').
+-- Convention: no semicolons inside string literals (runner splits on the
+-- semicolon character).
 
 CREATE TABLE IF NOT EXISTS accounts (
   id            INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
