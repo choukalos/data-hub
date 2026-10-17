@@ -1,21 +1,17 @@
-# Source registry: inbox subdirectory -> adapter.
-# The watcher polls INBOX_ROOT/<dir> for files, runs the adapter, then moves
-# processed files to INBOX_ROOT/processed/.
+# Source registry: inbox subdirectory (under INBOX_ROOT=/home/chuck/data/finance)
+# -> adapter. The watcher polls each dir for files, runs the adapter, then
+# moves the file to processed/.
 #
-# Suggested data layout (chuck creates the folders):
-#   /home/chuck/data/finance/bank/       current bank CSVs (categorized)
-#   /home/chuck/data/finance/bank-raw/   older raw bank CSVs (historical,
-#                                        poor/missing categories)
-#   /home/chuck/data/finance/tax/        tax XLSX (one row per year)
-#
-# categorize: false  -> load rows, skip rule/AI categorization (used for
-# historical raw data; categorize later via rules).
+# Layout:
+#   starone/               Starone enriched transaction CSVs (v1)
+#   tax/                   Choukalos Finances Summary XLSX (v1)
+#   v3-starone-raw/        raw per-account Starone exports (NOT watched — v3)
+#   v4-expense-analysis/   road-trip analysis workbooks (NOT watched — v4)
+#   skip/                  pivot artifacts, not transaction data (NOT watched)
+#   processed/             managed by data-hub (auto-created)
 sources:
-  - dir: bank
-    adapter: bank_csv
-  - dir: bank-raw
-    adapter: bank_csv
-    categorize: false
+  - dir: starone
+    adapter: starone_csv
   - dir: tax
     adapter: tax_xlsx
 

@@ -16,18 +16,20 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS categories (
   id            INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   name          VARCHAR(80) NOT NULL,
-  parent_id     INT UNSIGNED NULL,
+  -- 0 = top-level (bucket). NOT NULL (not NULL) so the unique key below
+  -- dedupes correctly (MySQL unique keys treat NULLs as distinct).
+  parent_id     INT UNSIGNED NOT NULL DEFAULT 0,
   bucket        VARCHAR(40) NOT NULL DEFAULT 'Other',
   sort_order    INT NOT NULL DEFAULT 0,
   created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE KEY uq_categories_name_parent (name, parent_id),
-  KEY idx_categories_bucket (bucket),
-  CONSTRAINT fk_categories_parent FOREIGN KEY (parent_id) REFERENCES categories (id)
+  KEY idx_categories_bucket (bucket)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Dedupe key: content_hash = sha256(account_id|txn_date|amount_cents|payee).
--- Same transaction re-exported (even from overlapping files) = same hash.
--- Upsert semantics: ON DUPLICATE KEY UPDATE description/external_txn_id/source_file
+-- Dedupe key: content_hash = sha256(account_id|txn_date|amount_cents|payee|description).
+-- Same transaction re-exported (even from overlapping files) = same hash
+-- (verified 2026-10-17: all 1,962 cross-file dups byte-identical).
+-- Upsert semantics: ON DUPLICATE KEY UPDATE description/category_id/source_file
 -- (newer export wins for mutable fields), imported_at preserved.
 CREATE TABLE IF NOT EXISTS transactions (
   id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,

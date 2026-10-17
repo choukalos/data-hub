@@ -1,10 +1,9 @@
 import os
-
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 
-from . import config, db
+from . import config, db, ingest
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "..", "migrations", "finance")
 
@@ -16,10 +15,12 @@ async def lifespan(app: FastAPI):
         app.state.migrations_applied = db.apply_migrations(MIGRATIONS_DIR, config.FINANCE_DB, conn)
     finally:
         conn.close()
+    app.state.watcher = ingest.start_watcher()
     yield
+    ingest.stop_watcher()
 
 
-app = FastAPI(title="data-hub", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="data-hub", version="0.2.0", lifespan=lifespan)
 
 
 @app.get("/api/health")
@@ -40,6 +41,7 @@ def health():
         "transactions": txn_count,
         "loads": load_count,
         "last_load": last,
+        "pending_files": ingest.discover_files(),
         "migrations_applied_on_start": app.state.migrations_applied,
     }
 
@@ -56,11 +58,11 @@ def migrate():
 
 
 @app.get("/api/loads")
-def loads(limit: int = 50):
+def loads(limit: int = Query(50, le=500)):
     conn = db.get_conn(config.FINANCE_DB)
     try:
         cur = conn.cursor(dictionary=True)
-        cur.execute("SELECT * FROM load_log ORDER BY ts DESC LIMIT %s", (min(limit, 500),))
+        cur.execute("SELECT * FROM load_log ORDER BY ts DESC LIMIT %s", (limit,))
         return {"loads": cur.fetchall()}
     finally:
         conn.close()
@@ -81,14 +83,39 @@ def load_detail(load_id: int):
 
 
 @app.post("/api/ingest")
-async def ingest():
-    # Phase 1: file upload + inbox watcher + adapters + staging/upsert.
-    raise HTTPException(501, "ingest lands in phase 1 (waiting on sample file formats)")
+async def ingest_file_upload(
+    file: UploadFile = File(...),
+    source: str = Query(..., description="source dir: starone | tax"),
+):
+    """Upload a file and ingest it immediately (same pipeline as the watcher)."""
+    data = await file.read()
+    try:
+        report = ingest.ingest_upload(data, file.filename or "upload", source)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if report["status"] == "error":
+        raise HTTPException(500, f"ingest failed: {report['issues']}")
+    return report
 
+
+@app.post("/api/ingest/run")
+def ingest_run():
+    """Manual trigger: ingest everything currently sitting in watched dirs."""
+    reports = ingest.scan_and_ingest()
+    return {"ingested": reports}
+
+
+@app.get("/api/sources")
+def sources():
+    """Source registry (watched dirs + adapters)."""
+    doc = ingest.load_sources()
+    return {"inbox_root": config.INBOX_ROOT, **doc}
+
+
+# --- phase 2 (categorization) -------------------------------------------------
 
 @app.get("/api/categories")
 def categories():
-    # Phase 2: category tree + review flow.
     raise HTTPException(501, "categorization lands in phase 2")
 
 
