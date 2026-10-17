@@ -12,14 +12,18 @@ produces a load_log row + report so issues surface at ingest time.
 import os
 import shutil
 import threading
+import json
+import logging
 from datetime import datetime, timezone
 
 import yaml
 
-from . import config
+from . import categorize, config
 from .adapters import ADAPTERS
 from .db import get_conn
 from .etl.pipeline import _write_error_load, ingest_file
+
+log = logging.getLogger("data-hub.ingest")
 
 INGEST_LOCK = threading.Lock()
 _stop = threading.Event()
@@ -85,6 +89,14 @@ def ingest_path(path: str, source_dir: str) -> dict:
         finally:
             conn.close()
 
+    # phase 2: categorize new data (best-effort — failures must not fail the
+    # ingest; they are appended to the load_log issues instead)
+    if report["status"] in ("ok", "partial"):
+        cat_issues = _post_ingest_categorize(report)
+        if cat_issues:
+            report["issues"].extend(cat_issues)
+            _record_load_issues(report["load_id"], cat_issues)
+
     # move to processed/ (ok, partial, or error — load_log keeps the record;
     # error files get an ERR_ prefix so the watcher doesn't retry in a loop)
     try:
@@ -97,6 +109,61 @@ def ingest_path(path: str, source_dir: str) -> dict:
     except OSError as e:
         report["issues"] = report.get("issues", []) + [f"could not move file to processed/: {e}"]
     return report
+
+
+def _post_ingest_categorize(report: dict) -> list:
+    """Rules + AI suggestions after a successful load (best-effort).
+
+    Never raises. Returns issue strings to append to the load_log row.
+    """
+    issues = []
+    try:
+        conn = get_conn(config.FINANCE_DB)
+        try:
+            rules = categorize.apply_rules(conn)
+            report["rules_applied"] = {
+                "matched": rules["matched"],
+                "payees_matched": rules["payees_matched"],
+                "categories_touched": rules["categories_touched"],
+            }
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("apply_rules after ingest %s failed: %s", report["file"], e)
+        issues.append(f"categorization: apply_rules failed: {e}")
+    try:
+        conn = get_conn(config.FINANCE_DB)
+        try:
+            report["ai_suggestions"] = categorize.suggest_categories(conn)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("suggest_categories after ingest %s failed: %s", report["file"], e)
+        issues.append(f"categorization: suggest_categories failed: {e}")
+    return issues
+
+
+def _record_load_issues(load_id: int, issues: list) -> None:
+    """Append post-ingest categorization issues to the committed load_log row."""
+    conn = get_conn(config.FINANCE_DB)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT issues FROM load_log WHERE id=%s", (load_id,))
+        row = cur.fetchone()
+        if not row:
+            return
+        existing = json.loads(row[0]) if row[0] else []
+        existing.extend(issues)
+        cur.execute(
+            "UPDATE load_log SET issues=%s, status='partial' WHERE id=%s",
+            (json.dumps(existing), load_id),
+        )
+        conn.commit()
+    except Exception as e:
+        log.warning("could not record categorization issues for load %s: %s", load_id, e)
+        conn.rollback()
+    finally:
+        conn.close()
 
 
 def scan_and_ingest() -> list:

@@ -52,10 +52,35 @@ curl -s http://thor.local:8100/api/health
 | POST | `/api/migrate` | apply pending migrations |
 | GET | `/api/loads?limit=` | load log |
 | GET | `/api/loads/{id}` | load detail (incl. issues) |
-| POST | `/api/ingest` | upload file (phase 1) |
-| GET | `/api/categories` | category tree (phase 2) |
-| GET | `/api/categories/pending` | AI suggestions (phase 2) |
-| POST | `/api/categories/review` | approve/reject/edit (phase 2) |
+| POST | `/api/ingest` | upload file for ingest |
+| GET | `/api/categories` | category tree with per-node txn counts + totals |
+| GET | `/api/categories/pending` | pending AI suggestions (category name/bucket + affected txn count) |
+| POST | `/api/categories/review` | approve / reject / edit a suggestion |
+| POST | `/api/categories/apply-rules` | re-run the rules engine over NULL-category txns |
+| POST | `/api/categories/suggest` | run one AI suggestion pass now (LiteLLM) |
+
+## Categorization loop (phase 2)
+
+1. **Ingest** loads transactions; rows whose category can't be resolved get
+   `category_id = NULL`.
+2. **Rules engine** (`server/categorize.py::apply_rules`) matches the payee of
+   NULL-category transactions against `category_rules` with
+   exact → contains → prefix → regex precedence (first match wins; bad
+   regexes are skipped + logged). Runs automatically after every ingest and
+   can be re-run with `POST /api/categories/apply-rules`.
+3. **AI suggestions** (`suggest_categories`) asks the LiteLLM proxy (cheap
+   model, strict JSON) to pick the best *existing* category for each distinct
+   uncategorized payee (batches of 40, category tree passed in, leaf
+   preferred). Results land in `category_suggestions` as `pending`, one per
+   payee. Runs automatically after every ingest (best-effort — failures are
+   logged to the load's issues and never fail the ingest) and on demand via
+   `POST /api/categories/suggest` (response includes an LLM call log).
+4. **Human review** via `GET /api/categories/pending` +
+   `POST /api/categories/review`:
+   - `approve` → creates an exact-payee rule (`source='ai'`), backfills the
+     payee's NULL-category transactions, rebuilds `monthly_category_summary`
+   - `reject` → marks the suggestion rejected
+   - `edit` → change the suggested category, then behaves like approve
 
 ## Security
 

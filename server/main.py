@@ -1,9 +1,11 @@
 import os
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from pydantic import BaseModel
 
-from . import config, db, ingest
+from . import categorize, config, db, ingest
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "..", "migrations", "finance")
 
@@ -114,16 +116,67 @@ def sources():
 
 # --- phase 2 (categorization) -------------------------------------------------
 
+class ReviewBody(BaseModel):
+    suggestion_id: int
+    action: str  # approve | reject | edit
+    category_id: Optional[int] = None  # required for action='edit'
+
+
 @app.get("/api/categories")
 def categories():
-    raise HTTPException(501, "categorization lands in phase 2")
+    """Nested category tree (buckets -> children) with txn counts + totals."""
+    conn = db.get_conn(config.FINANCE_DB)
+    try:
+        return categorize.category_tree(conn)
+    finally:
+        conn.close()
 
 
 @app.get("/api/categories/pending")
 def pending_suggestions():
-    raise HTTPException(501, "categorization lands in phase 2")
+    """AI suggestions awaiting review (with category name/bucket + impact)."""
+    conn = db.get_conn(config.FINANCE_DB)
+    try:
+        return categorize.pending_suggestions(conn)
+    finally:
+        conn.close()
+
+
+@app.post("/api/categories/apply-rules")
+def apply_rules():
+    """Re-run the rules engine over existing NULL-category transactions."""
+    conn = db.get_conn(config.FINANCE_DB)
+    try:
+        return categorize.apply_rules(conn)
+    finally:
+        conn.close()
+
+
+@app.post("/api/categories/suggest")
+def suggest_categories():
+    """Run one AI suggestion pass now (LiteLLM); returns count + LLM log."""
+    conn = db.get_conn(config.FINANCE_DB)
+    try:
+        return categorize.suggest_categories(conn)
+    finally:
+        conn.close()
 
 
 @app.post("/api/categories/review")
-def review_suggestion():
-    raise HTTPException(501, "categorization lands in phase 2")
+def review_suggestion(body: ReviewBody):
+    """Approve / reject / edit a pending suggestion.
+
+    approve -> creates an exact payee rule, backfills NULL-category txns,
+    rebuilds monthly_category_summary. edit -> change category, then approve.
+    """
+    conn = db.get_conn(config.FINANCE_DB)
+    try:
+        return categorize.review_suggestion(
+            conn, body.suggestion_id, body.action, body.category_id
+        )
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        conn.close()

@@ -160,12 +160,14 @@ def ingest_file(conn, path: str, adapter) -> dict:
         (filename, sha, adapter.name, len(result.rows), rows_new, rows_updated,
          0, date_min, date_max, status, _json(issues)),
     )
+    load_id = cur.lastrowid
     conn.commit()
 
     spend = sum(r.amount_cents for r in result.rows if isinstance(r, NormalizedTxn) and r.amount_cents < 0)
     income = sum(r.amount_cents for r in result.rows if isinstance(r, NormalizedTxn) and r.amount_cents > 0)
     return {
         "file": filename,
+        "load_id": load_id,
         "sha256": sha,
         "adapter": adapter.name,
         "rows_total": len(result.rows),
