@@ -82,6 +82,43 @@ curl -s http://thor.local:8100/api/health
    - `reject` → marks the suggestion rejected
    - `edit` → change the suggested category, then behaves like approve
 
+## v1 dashboards + ingest/review loop (phase 4)
+
+**Dashboards.** The read-only [report-hub](../report-hub) (:8101) ships
+five v1 finance dashboards, seeded from
+`report-hub/seed/v1_finance_dashboards.sql` (money = integer cents; spend =
+debits, Transfer/Income excluded):
+
+| Dashboard | Answers |
+|---|---|
+| `/d/overview` | Spend last month / 12mo with MoM/YoY deltas, savings rate (latest tax year), kid share of spend, monthly trend + top-10 categories |
+| `/d/categories?category=<Bucket>` | One top-level bucket: 12mo spend + MoM, 24mo trend, top payees, recent transactions, all-21-bucket comparison (default = top-spend bucket) |
+| `/d/kids` | Kid spend (Kids + Education buckets): 12mo, share of total, YoY, by year, top payees, recent transactions |
+| `/d/tax-savings` | Income / income tax paid / est. savings / savings rate per tax year, with prior-year deltas |
+| `/d/data-health` | Ingest history, uncategorized count, pending suggestions, per-bucket MoM/YoY spend watch (ALERT when > 30%) |
+
+Open them at `http://thor.local:8101/d/<slug>`. To refresh the seeded
+static bits (e.g. after the `?category=` default or the kid definition
+changes), re-run the idempotent seed as `dh_reports`:
+`mysql -h thor.local -u dh_reports -p reports <
+report-hub/seed/v1_finance_dashboards.sql`.
+
+**Ingest new files.** Drop a bank CSV / tax XLSX into a watched
+subdirectory of `/home/chuck/data/finance/` (see `sources.yaml` —
+currently `starone/` and `tax/`; ingested files move to `processed/`) or
+upload via `POST /api/ingest` (multipart). The watcher and the endpoint
+run the same pipeline: rules engine → AI suggestions → `load_log`
+provenance. Check `GET /api/loads` afterwards.
+
+**Categorization review loop.** Uncategorized payees get AI suggestions
+(`category_suggestions`, status `pending`) after each ingest. Review them
+with `GET /api/categories/pending` + `POST /api/categories/review`
+(approve → creates a rule + backfills the payee's transactions; reject;
+or edit the category first). Re-run the rules engine over NULL-category
+txns with `POST /api/categories/apply-rules`, and force an AI suggestion
+pass with `POST /api/categories/suggest`. Approved suggestions become
+rules, so the same payee is never re-suggested.
+
 ## Security
 
 - LAN only, no auth (homelab-only by design).
