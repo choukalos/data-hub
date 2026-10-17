@@ -1,0 +1,23 @@
+# Source registry: inbox subdirectory -> adapter.
+# The watcher polls INBOX_ROOT/<dir> for files, runs the adapter, then moves
+# processed files to INBOX_ROOT/processed/.
+#
+# Suggested data layout (chuck creates the folders):
+#   /home/chuck/data/finance/bank/       current bank CSVs (categorized)
+#   /home/chuck/data/finance/bank-raw/   older raw bank CSVs (historical,
+#                                        poor/missing categories)
+#   /home/chuck/data/finance/tax/        tax XLSX (one row per year)
+#
+# categorize: false  -> load rows, skip rule/AI categorization (used for
+# historical raw data; categorize later via rules).
+sources:
+  - dir: bank
+    adapter: bank_csv
+  - dir: bank-raw
+    adapter: bank_csv
+    categorize: false
+  - dir: tax
+    adapter: tax_xlsx
+
+poll_seconds: 10
+processed_dirname: processed
