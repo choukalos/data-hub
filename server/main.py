@@ -1,13 +1,39 @@
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import mysql.connector
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 from . import categorize, config, db, ingest
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "..", "migrations", "finance")
+HUB_MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "..", "migrations", "hub")
+
+log = logging.getLogger("data-hub.migrate")
+
+
+def apply_hub_migrations():
+    """Apply hub migrations (v2a generic datasets).
+
+    Best-effort: the hub db may not be provisioned yet, so any failure only
+    logs a warning and returns [] — finance ingest must never break because
+    of it. Returns the list of migration versions applied now.
+    """
+    try:
+        conn = db.get_conn(config.HUB_DB)
+    except mysql.connector.Error as e:
+        log.warning("hub db unreachable, skipping hub migrations: %s", e)
+        return []
+    try:
+        return db.apply_migrations(HUB_MIGRATIONS_DIR, config.HUB_DB, conn)
+    except mysql.connector.Error as e:
+        log.warning("hub migrations failed on %r db, skipping: %s", config.HUB_DB, e)
+        return []
+    finally:
+        conn.close()
 
 
 @asynccontextmanager
@@ -17,6 +43,7 @@ async def lifespan(app: FastAPI):
         app.state.migrations_applied = db.apply_migrations(MIGRATIONS_DIR, config.FINANCE_DB, conn)
     finally:
         conn.close()
+    app.state.hub_migrations_applied = apply_hub_migrations()
     app.state.watcher = ingest.start_watcher()
     yield
     ingest.stop_watcher()
@@ -45,6 +72,7 @@ def health():
         "last_load": last,
         "pending_files": ingest.discover_files(),
         "migrations_applied_on_start": app.state.migrations_applied,
+        "hub_migrations_applied_on_start": getattr(app.state, "hub_migrations_applied", []),
     }
 
 
@@ -56,7 +84,8 @@ def migrate():
         applied = db.apply_migrations(MIGRATIONS_DIR, config.FINANCE_DB, conn)
     finally:
         conn.close()
-    return {"applied": applied}
+    hub_applied = apply_hub_migrations()
+    return {"applied": applied, "hub_applied": hub_applied}
 
 
 @app.get("/api/loads")

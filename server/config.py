@@ -6,6 +6,10 @@ MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
 MYSQL_USER = os.environ.get("MYSQL_USER", "dh_app")
 MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
 FINANCE_DB = os.environ.get("FINANCE_DB", "finance")
+# v2a: generic datasets live in a separate db (provisioned out-of-band by
+# homelab/data-hub/provision.sh; may not exist yet — hub migrations are
+# best-effort and skip with a warning).
+HUB_DB = os.environ.get("HUB_DB", "hub")
 
 # --- Ingestion ---
 # INBOX_ROOT is the finance data dir (host: /home/chuck/data/finance).
