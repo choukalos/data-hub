@@ -21,6 +21,23 @@ from ..adapters.base import NormalizedTxn
 from ..adapters.generic_csv import parse_column_map, safe_column_name, split_entry
 
 
+def hub_schema_ready(conn) -> bool:
+    """v2a: True if the hub db has the datasets table (migrations applied).
+
+    The hub db may exist without tables (provisioned, but data-hub not yet
+    restarted / /api/migrate not yet called). Callers use this to degrade
+    to the 'hub unavailable' path (503 / file stays pending) instead of
+    failing with 1146 (table doesn't exist).
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema=%s AND table_name='datasets' LIMIT 1",
+        (config.HUB_DB,),
+    )
+    return cur.fetchone() is not None
+
+
 def _sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:

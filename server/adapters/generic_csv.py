@@ -155,8 +155,16 @@ def _hash_repr(v) -> str:
 
 
 def content_hash(target_table: str, key_columns, values: dict, ordered_cols: list) -> str:
-    """sha256(target_table | key values joined by \\x1f); all values if no keys."""
+    """sha256(target_table | key values joined by \\x1f); all values if no keys.
+
+    Raises ValueError when a key column is missing from values: hashing a
+    missing key as empty would silently collapse distinct rows onto one
+    content_hash (data corruption), so fail loudly instead.
+    """
     if key_columns:
+        missing = [k for k in key_columns if k not in values]
+        if missing:
+            raise ValueError(f"key column(s) {missing} missing from values")
         parts = [target_table] + [_hash_repr(values.get(k)) for k in key_columns]
     else:
         parts = [_hash_repr(values.get(c)) for c in ordered_cols]
@@ -284,6 +292,20 @@ class GenericCsvAdapter(Adapter):
         self.column_map = column_map
 
         ordered = [split_entry(column_map[hcol])[0] for hcol in header if hcol in column_map]
+        if key_columns:
+            # key_columns reference FINAL target column names. Reserved names
+            # (id, content_hash, ingested_at) are renamed on import (id ->
+            # col_id), so a stale key name would otherwise hash every row to
+            # the same value and collapse the file into one row. Fail the
+            # load with a clear issue instead.
+            missing = [k for k in key_columns if k not in ordered]
+            if missing:
+                result.issues.append(
+                    f"key_columns {missing} not among target columns {ordered} — "
+                    "load aborted (reserved names like 'id' are renamed, e.g. id -> col_id)"
+                )
+                self.column_map = column_map
+                return result
         out = []
         for lineno, r in valid:
             values = {}

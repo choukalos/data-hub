@@ -10,8 +10,8 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 from . import categorize, config, db, ingest
-from .adapters.generic_csv import split_entry
-from .etl.pipeline import _qualify
+from .adapters.generic_csv import RESERVED_COLS, split_entry
+from .etl.pipeline import _qualify, hub_schema_ready
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "..", "migrations", "finance")
 HUB_MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "..", "migrations", "hub")
@@ -168,11 +168,29 @@ class DatasetBody(BaseModel):
 
 
 def _hub_conn():
-    """Connect to the hub db; 503 if it is not provisioned yet."""
+    """Connect to the hub db; 503 if it is not provisioned/migrated yet.
+
+    'Not ready' covers both the db being unreachable and the db existing
+    without the v2a tables (migrations not yet applied — e.g. the container
+    started before provision.sh ran). Both degrade to 503, never 500.
+    """
     try:
-        return db.get_conn(config.HUB_DB)
+        conn = db.get_conn(config.HUB_DB)
     except mysql.connector.Error as e:
         raise HTTPException(503, f"hub db unavailable: {e}")
+    try:
+        ready = hub_schema_ready(conn)
+    except mysql.connector.Error as e:
+        conn.close()
+        raise HTTPException(503, f"hub db unavailable: {e}")
+    if not ready:
+        conn.close()
+        raise HTTPException(
+            503,
+            "hub db not migrated (hub.datasets missing) — restart data-hub "
+            "or POST /api/migrate",
+        )
+    return conn
 
 
 def _validate_dataset(body: DatasetBody) -> str:
@@ -204,6 +222,14 @@ def _validate_dataset(body: DatasetBody) -> str:
                 or not all(isinstance(c, str) and _MYSQL_IDENT_RE.match(c)
                            for c in body.key_columns)):
             raise HTTPException(400, "key_columns must be a non-empty list of column names")
+        reserved = [c for c in body.key_columns if c in RESERVED_COLS]
+        if reserved:
+            raise HTTPException(
+                400,
+                f"key_columns {reserved} are reserved (id/content_hash/ingested_at) and "
+                "are renamed on import (e.g. id -> col_id); use the renamed target "
+                "column name instead",
+            )
     return name
 
 
