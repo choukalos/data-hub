@@ -2,7 +2,10 @@
 
 Status: v2a implemented (2026-10-18; production E2E pending `hub` db
 provisioning — `provision.sh` needs root; unit tests + scratch-MySQL E2E
-passed). v2b (mcp_datahub) remains spec.
+passed). v2b (mcp_datahub) implemented 2026-10-18 (10 tools, MCP handshake
++ read-only tool calls verified; ingest_file verified with a scratch file).
+Both pending the `hub` db provisioning + data-hub restart for the full
+production E2E.
 Implements the v2 items from ARCHITECTURE.md sections 9/10:
 (1) generic-dataset ETL adapter, (2) MCP wrapper for data-hub.
 
@@ -90,27 +93,37 @@ over generic data.
 
 ## v2b — mcp_datahub (MCP server)
 
+Implemented 2026-10-18 at `homelab/mcp/servers/datahub/` (server.py,
+Dockerfile, pyproject.toml, README.md); compose service `mcp_datahub` in
+`homelab/compose/compose.mcp.yml`; registered in `homelab/litellm/config.yml`
+(SSE, allow_all_keys, like the other MCP servers).
+
 New MCP server `mcp_datahub` (same pattern as `mcp_mysql` in
-`/home/chuck/homelab/mcp/`): FastMCP, HTTP transport, LAN-only, wraps the
-data-hub REST API (http://192.168.4.54:8100) so any LLM client can drive
+`/home/chuck/homelab/mcp/`): FastMCP, SSE transport, LAN-only, wraps the
+data-hub REST API (http://data-hub:8100) so any LLM client can drive
 ingest + categorization review:
 
-- `ingest_file(filename)` — POST a file from the host inbox path
-  (`/home/chuck/data/finance/inbox/<filename>`) to data-hub; returns the
-  load report.
-- `list_loads(db="finance", limit=20)` — recent loads.
-- `load_detail(load_id)` — full load report + issues.
-- `pending_categories()` — uncategorized payees with 12-month totals.
+- `health()` — liveness + counts + last load + pending files.
+- `ingest_file(filename)` — POST a file from the mounted inbox
+  (`/home/chuck/data/finance/inbox` -> `/inbox:ro`) to data-hub
+  (`?source=inbox`); returns the load report. Filename sanitized
+  (alnum/./-/_) — also blocks path traversal.
+- `list_loads(db="finance", limit=20)` — recent loads (finance | hub).
+- `load_detail(load_id)` — full finance load report + issues (hub loads
+  carry the full report in list_loads(db="hub")).
+- `pending_categories()` — suggestions awaiting review.
+- `list_categories()` — category tree with ids (needed for edit reviews).
 - `suggest_categories()` — trigger the LiteLLM suggestion pass.
 - `review_category(suggestion_id, action, category_id?)` —
   approve/reject/edit via the review API.
-- `list_datasets()` / `dataset_preview(name)` — v2a registry.
+- `list_datasets()` / `dataset_preview(name, limit)` — v2a registry.
 
-Compose: add `mcp_datahub` service to the homelab compose (or its own
-file), env: DATAHUB_URL, INBOX_DIR. Tool descriptions written for LLM
-consumption (what each returns, when to use). Verify with an MCP client
-handshake + one tool call each (read-only ones; do not trigger real
-ingests of real files during verification — use a scratch file).
+Env: DATAHUB_URL, INBOX_DIR, HTTP_TIMEOUT (60s), INGEST_TIMEOUT (600s —
+LLM passes are slow). Tool descriptions written for LLM consumption (what
+each returns, when to use). Verified with an MCP client handshake + one
+tool call each (read-only ones; ingest_file with a scratch file — with the
+hub db unprovisioned it can only come back status=pending, so no real
+data moves).
 
 ## Out of scope (v2)
 
