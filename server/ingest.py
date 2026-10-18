@@ -15,13 +15,16 @@ import threading
 import json
 import logging
 from datetime import datetime, timezone
+from fnmatch import fnmatch
 
+import mysql.connector
 import yaml
 
 from . import categorize, config
 from .adapters import ADAPTERS
+from .adapters.generic_csv import GenericCsvAdapter
 from .db import get_conn
-from .etl.pipeline import _write_error_load, ingest_file
+from .etl.pipeline import _write_error_load, ingest_file, upsert_dataset_rows
 
 log = logging.getLogger("data-hub.ingest")
 
@@ -64,15 +67,43 @@ def discover_files():
     return out
 
 
-def ingest_path(path: str, source_dir: str) -> dict:
-    """Run one file through the pipeline; move it to processed/ when done."""
-    doc = load_sources()
-    src = next((s for s in doc["sources"] if s["dir"] == source_dir), None)
-    if src is None:
-        raise ValueError(f"unknown source dir {source_dir!r}")
-    adapter = ADAPTERS[src["adapter"]]
-    filename = os.path.basename(path)
+def resolve_generic(path: str):
+    """v2a: pick an adapter for a file in a generic-inbox dir.
 
+    Bank/tax adapters claim first (detect()); then active hub.datasets rows
+    whose source_pattern fnmatches the basename. Returns (adapter,
+    dataset_row); (None, None) when nothing claims the file — it stays
+    pending (not ingested, not moved).
+    """
+    for adapter in ADAPTERS.values():
+        if adapter.detect(path):
+            return adapter, None
+    try:
+        conn = get_conn(config.HUB_DB)
+    except mysql.connector.Error as e:
+        log.warning("hub db unavailable, cannot resolve dataset for %s: %s",
+                    os.path.basename(path), e)
+        return None, None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM datasets WHERE is_active=1 ORDER BY name")
+        dsets = cur.fetchall()
+    except mysql.connector.Error as e:
+        log.warning("hub.datasets unreadable, leaving %s pending: %s",
+                    os.path.basename(path), e)
+        return None, None
+    finally:
+        conn.close()
+    base = os.path.basename(path)
+    for ds in dsets:
+        pattern = ds.get("source_pattern")
+        if pattern and fnmatch(base, str(pattern)):
+            return GenericCsvAdapter(dict(ds)), ds
+    return None, None
+
+
+def _ingest_finance(path: str, adapter, filename: str) -> dict:
+    """Bank/tax pipeline (finance db). One file, one transaction."""
     with INGEST_LOCK:
         conn = get_conn(config.FINANCE_DB)
         try:
@@ -88,10 +119,80 @@ def ingest_path(path: str, source_dir: str) -> dict:
             }
         finally:
             conn.close()
+    return report
 
-    # phase 2: categorize new data (best-effort — failures must not fail the
-    # ingest; they are appended to the load_log issues instead)
-    if report["status"] in ("ok", "partial"):
+
+def _ingest_generic(path: str, adapter, dataset: dict, filename: str):
+    """v2a: generic adapter + upsert into the dataset's hub table.
+
+    One file, one transaction (hub db). Returns the load report, or None if
+    the hub db is unreachable (caller leaves the file pending — the watcher
+    retries on the next poll).
+    """
+    with INGEST_LOCK:
+        try:
+            conn = get_conn(config.HUB_DB)
+        except mysql.connector.Error as e:
+            log.warning("hub db unavailable, leaving %s pending: %s", filename, e)
+            return None
+        try:
+            result = adapter.load(path)
+            return upsert_dataset_rows(
+                conn, dataset, result.rows,
+                column_map=adapter.column_map,
+                source_file=filename, sha256=_sha256(path),
+                issues=result.issues, skipped=result.skipped,
+            )
+        except Exception as e:
+            conn.rollback()
+            return {
+                "file": filename, "adapter": "generic_csv", "status": "error",
+                "issues": [f"ERROR: {e}"], "rows_total": 0, "rows_new": 0,
+                "rows_updated": 0, "date_min": None, "date_max": None,
+            }
+        finally:
+            conn.close()
+
+
+def ingest_path(path: str, source_dir: str) -> dict:
+    """Run one file through the pipeline; move it to processed/ when done.
+
+    v2a: dirs not bound to a bank/tax adapter (sources.yaml adapter:
+    generic_csv) resolve per file — bank/tax adapters claim first, then
+    active hub.datasets source_patterns; unmatched files stay pending
+    (not ingested, not moved).
+    """
+    doc = load_sources()
+    src = next((s for s in doc["sources"] if s["dir"] == source_dir), None)
+    if src is None:
+        raise ValueError(f"unknown source dir {source_dir!r}")
+    filename = os.path.basename(path)
+
+    adapter = ADAPTERS.get(src["adapter"])
+    dataset = None
+    if adapter is None:
+        adapter, dataset = resolve_generic(path)
+        if adapter is None:
+            return {
+                "file": filename, "adapter": None, "status": "pending",
+                "issues": [], "rows_total": 0, "rows_new": 0,
+                "rows_updated": 0, "date_min": None, "date_max": None,
+            }
+
+    if dataset is not None:
+        report = _ingest_generic(path, adapter, dataset, filename)
+        if report is None:  # hub db unavailable — file stays pending
+            return {
+                "file": filename, "adapter": "generic_csv", "status": "pending",
+                "issues": [], "rows_total": 0, "rows_new": 0,
+                "rows_updated": 0, "date_min": None, "date_max": None,
+            }
+    else:
+        report = _ingest_finance(path, adapter, filename)
+
+    # phase 2: categorize new data (finance only; best-effort — failures must
+    # not fail the ingest; they are appended to the load_log issues instead)
+    if dataset is None and report["status"] in ("ok", "partial"):
         cat_issues = _post_ingest_categorize(report)
         if cat_issues:
             report["issues"].extend(cat_issues)

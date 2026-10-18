@@ -42,6 +42,7 @@ class LoadResult:
     rows: list = field(default_factory=list)
     issues: list = field(default_factory=list)  # human-readable strings
     accounts: list = field(default_factory=list)  # distinct accounts found
+    skipped: int = 0  # rows skipped while loading (v2a generic adapter)
 
 
 class Adapter(ABC):

@@ -5,6 +5,11 @@
 # Layout:
 #   starone/               Starone enriched transaction CSVs (v1)
 #   tax/                   Choukalos Finances Summary XLSX (v1)
+#   inbox/                 generic CSV/TSV datasets (v2a) — resolved per file:
+#                          bank/tax adapters claim first, then active
+#                          hub.datasets source_patterns; unmatched files stay
+#                          pending (adapter: generic_csv is a sentinel, not a
+#                          registered adapter)
 #   v3-starone-raw/        raw per-account Starone exports (NOT watched — v3)
 #   v4-expense-analysis/   road-trip analysis workbooks (NOT watched — v4)
 #   skip/                  pivot artifacts, not transaction data (NOT watched)
@@ -14,6 +19,8 @@ sources:
     adapter: starone_csv
   - dir: tax
     adapter: tax_xlsx
+  - dir: inbox
+    adapter: generic_csv
 
 poll_seconds: 10
 processed_dirname: processed

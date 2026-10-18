@@ -17,6 +17,32 @@ Architecture doc: `homelab/data-hub/ARCHITECTURE.md`
 - **Categorization**: rules + AI suggestions + human review flow
 - **Migrations**: versioned SQL in `migrations/finance/`, auto-applied on start
 
+## What it does (v2a — generic datasets)
+
+Drop any CSV/TSV into `inbox/` (or `POST /api/ingest?source=inbox`) and it
+lands idempotently in a table under the separate `hub` database — the
+daily-ingest pattern for non-finance data (work-app analytics, blog
+metrics, anything). Design: `docs/v2-generic-datasets.md` (v2a).
+
+- **Registry** `hub.datasets`: name (slug), `source_pattern` filename glob,
+  delimiter (`,`/tab), `has_header`, `column_map` JSON, `key_columns` JSON.
+  Bank/tax adapters claim files first; files matching no active pattern stay
+  pending (not ingested, not moved).
+- **Adapter** `server/adapters/generic_csv.py` (stdlib csv, no new deps):
+  column inference on first import (all-int → BIGINT, int/float →
+  DECIMAL(18,4), ISO dates → DATE, else VARCHAR(512); empty → NULL), frozen
+  into `datasets.column_map` afterwards.
+- **Idempotent upsert** into `hub.ds_<name>`: `content_hash` UNIQUE +
+  `ON DUPLICATE KEY UPDATE` — re-dropping a file = 0 new / N updated.
+- **Provenance** `hub.load_log`: same shape as `finance.load_log` plus
+  `dataset_name`.
+- **API**: `GET/POST /api/datasets`, `DELETE /api/datasets/{name}`
+  (deactivate, rows kept), `GET /api/datasets/{name}/preview?limit=50`, and
+  `GET /api/loads?db=finance|hub` (default finance, unchanged).
+- The `hub` db is created by `provision.sh` (root). Until it exists, hub
+  endpoints return 503 and startup skips hub migrations with a warning —
+  finance ingest is never affected.
+
 ## Data layout (host)
 
 ```
@@ -24,6 +50,7 @@ Architecture doc: `homelab/data-hub/ARCHITECTURE.md`
   bank/        current bank CSVs (categorized)
   bank-raw/    older raw CSVs (historical, poor categories)
   tax/         tax XLSX (one row per year)
+  inbox/       generic CSV/TSV datasets (v2a, resolved per file)
   processed/   data-hub moves ingested files here (auto-created)
 ```
 
@@ -33,8 +60,10 @@ Architecture doc: `homelab/data-hub/ARCHITECTURE.md`
 bash /home/chuck/homelab/data-hub/provision.sh
 ```
 
-Creates `finance` + `reports` DBs and the `dh_app` / `dh_reports` users,
-and grants `SELECT finance.*` to the existing `ai` user (mcp_mysql Q&A).
+Creates `finance` + `reports` + `hub` DBs and the `dh_app` / `dh_reports`
+users, and grants `SELECT finance.*` to the existing `ai` user (mcp_mysql
+Q&A). `dh_reports` also gets `SELECT hub.*` for report-hub dashboards over
+generic data.
 
 ## Run
 
@@ -44,15 +73,19 @@ docker compose -f compose.data-hub.yml up -d --build data-hub
 curl -s http://thor.local:8100/api/health
 ```
 
-## API (v1)
+## API
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/health` | liveness + counts + last load |
-| POST | `/api/migrate` | apply pending migrations |
-| GET | `/api/loads?limit=` | load log |
+| POST | `/api/migrate` | apply pending migrations (finance + hub) |
+| GET | `/api/loads?limit=&db=finance\|hub` | load log (default finance) |
 | GET | `/api/loads/{id}` | load detail (incl. issues) |
-| POST | `/api/ingest` | upload file for ingest |
+| POST | `/api/ingest` | upload file for ingest (`?source=inbox` for generic) |
+| GET | `/api/datasets` | generic dataset registry (with target-table row counts) |
+| POST | `/api/datasets` | register a dataset `{name, source_pattern, ...}` |
+| DELETE | `/api/datasets/{name}` | deactivate a dataset (rows kept) |
+| GET | `/api/datasets/{name}/preview?limit=50` | latest rows from the target table |
 | GET | `/api/categories` | category tree with per-node txn counts + totals |
 | GET | `/api/categories/pending` | pending AI suggestions (category name/bucket + affected txn count) |
 | POST | `/api/categories/review` | approve / reject / edit a suggestion |
@@ -108,7 +141,10 @@ subdirectory of `/home/chuck/data/finance/` (see `sources.yaml` —
 currently `starone/` and `tax/`; ingested files move to `processed/`) or
 upload via `POST /api/ingest` (multipart). The watcher and the endpoint
 run the same pipeline: rules engine → AI suggestions → `load_log`
-provenance. Check `GET /api/loads` afterwards.
+provenance. Check `GET /api/loads` afterwards. Generic CSV/TSV files go to
+`inbox/` (v2a): bank/tax adapters claim first, then active
+`hub.datasets.source_pattern` globs; unmatched files stay pending. Check
+`GET /api/datasets` + `GET /api/loads?db=hub` afterwards.
 
 **Categorization review loop.** Uncategorized payees get AI suggestions
 (`category_suggestions`, status `pending`) after each ingest. Review them
@@ -122,18 +158,22 @@ rules, so the same payee is never re-suggested.
 ## Security
 
 - LAN only, no auth (homelab-only by design).
-- `dh_app` has ALL on `finance.*` only. It is the sole writer to finance data.
+- `dh_app` has ALL on `finance.*` and `hub.*` only. It is the sole writer
+  to finance and hub data.
 - Bank data never leaves the homelab.
 
 ## Repo layout
 
 ```
 migrations/finance/   versioned schema migrations (0001_init.sql, ...)
+migrations/hub/       v2a hub schema (datasets + load_log)
 server/
   main.py             FastAPI app
   config.py           env config
   db.py               connections + migration runner
-  adapters/           per-format file adapters (bank_csv, tax_xlsx)
-  etl/                staging → canonical pipeline
+  adapters/           per-format file adapters (starone_csv, tax_xlsx,
+                      generic_csv)
+  etl/                staging → canonical pipeline + dataset upsert
 sources.yaml          inbox subdir -> adapter registry
+tests/                unit tests (python3 tests/test_generic_csv.py)
 ```

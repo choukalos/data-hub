@@ -1,8 +1,10 @@
 # v2 design: generic dataset ETL + mcp_datahub
 
-Status: spec (2026-10-17). Implements the v2 items from ARCHITECTURE.md
-sections 9/10: (1) generic-dataset ETL adapter, (2) MCP wrapper for
-data-hub.
+Status: v2a implemented (2026-10-18; production E2E pending `hub` db
+provisioning — `provision.sh` needs root; unit tests + scratch-MySQL E2E
+passed). v2b (mcp_datahub) remains spec.
+Implements the v2 items from ARCHITECTURE.md sections 9/10:
+(1) generic-dataset ETL adapter, (2) MCP wrapper for data-hub.
 
 ## v2a — Generic dataset adapter (data-hub)
 

@@ -1,5 +1,7 @@
+import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -8,6 +10,8 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 from . import categorize, config, db, ingest
+from .adapters.generic_csv import split_entry
+from .etl.pipeline import _qualify
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "..", "migrations", "finance")
 HUB_MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "..", "migrations", "hub")
@@ -89,8 +93,11 @@ def migrate():
 
 
 @app.get("/api/loads")
-def loads(limit: int = Query(50, le=500)):
-    conn = db.get_conn(config.FINANCE_DB)
+def loads(limit: int = Query(50, le=500), db_name: str = Query("finance", alias="db")):
+    """Recent loads. ?db=finance (default, unchanged) | hub (v2a generic)."""
+    if db_name not in ("finance", "hub"):
+        raise HTTPException(400, "db must be 'finance' or 'hub'")
+    conn = _hub_conn() if db_name == "hub" else db.get_conn(config.FINANCE_DB)
     try:
         cur = conn.cursor(dictionary=True)
         cur.execute("SELECT * FROM load_log ORDER BY ts DESC LIMIT %s", (limit,))
@@ -141,6 +148,166 @@ def sources():
     """Source registry (watched dirs + adapters)."""
     doc = ingest.load_sources()
     return {"inbox_root": config.INBOX_ROOT, **doc}
+
+
+# --- v2a: generic datasets (hub db) -------------------------------------------
+
+_DATASET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_MYSQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_QUALIFIED_TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class DatasetBody(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    source_pattern: str
+    delimiter: Optional[str] = ","
+    has_header: Optional[int] = 1
+    column_map: Optional[dict] = None
+    key_columns: Optional[list] = None
+
+
+def _hub_conn():
+    """Connect to the hub db; 503 if it is not provisioned yet."""
+    try:
+        return db.get_conn(config.HUB_DB)
+    except mysql.connector.Error as e:
+        raise HTTPException(503, f"hub db unavailable: {e}")
+
+
+def _validate_dataset(body: DatasetBody) -> str:
+    """Validate a registration body; return the normalized name (400 on bad)."""
+    name = (body.name or "").strip()
+    if not _DATASET_NAME_RE.match(name) or len(name) > 70:
+        raise HTTPException(400, "name must be a slug (lowercase letters, digits, _ or -)")
+    pattern = (body.source_pattern or "").strip()
+    if not pattern:
+        raise HTTPException(400, "source_pattern is required")
+    if body.delimiter not in (",", "\t"):
+        raise HTTPException(400, "delimiter must be ',' or '\\t'")
+    if int(body.has_header or 0) not in (0, 1):
+        raise HTTPException(400, "has_header must be 0 or 1")
+    if body.column_map is not None:
+        if not isinstance(body.column_map, dict) or not body.column_map:
+            raise HTTPException(400, "column_map must be a non-empty object")
+        for k, v in body.column_map.items():
+            if not str(k).strip():
+                raise HTTPException(400, f"column_map key {k!r} is empty")
+            try:
+                tcol, _ctype = split_entry(str(v))
+            except ValueError:
+                raise HTTPException(400, f"column_map value for {k!r} must be 'target_col TYPE'")
+            if not _MYSQL_IDENT_RE.match(tcol):
+                raise HTTPException(400, f"column_map target {tcol!r} is not a valid identifier")
+    if body.key_columns is not None:
+        if (not isinstance(body.key_columns, list) or not body.key_columns
+                or not all(isinstance(c, str) and _MYSQL_IDENT_RE.match(c)
+                           for c in body.key_columns)):
+            raise HTTPException(400, "key_columns must be a non-empty list of column names")
+    return name
+
+
+def _get_dataset(name: str) -> dict:
+    conn = _hub_conn()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM datasets WHERE name=%s", (name,))
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(404, f"dataset {name!r} not found")
+    return row
+
+
+def _dataset_row_count(conn, target_table) -> int:
+    if not target_table or not _QUALIFIED_TABLE_RE.match(str(target_table)):
+        return 0
+    try:
+        cur = conn.cursor()  # tuple cursor (the list cursor is dictionary)
+        cur.execute(f"SELECT COUNT(*) FROM {_qualify(target_table)}")
+        return cur.fetchone()[0]
+    except mysql.connector.Error:
+        return 0  # target table not created yet (no import yet)
+
+
+@app.get("/api/datasets")
+def list_datasets():
+    """Generic dataset registry (hub db) with target-table row counts."""
+    conn = _hub_conn()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM datasets ORDER BY name")
+        out = []
+        for ds in cur.fetchall():
+            ds["row_count"] = _dataset_row_count(conn, ds.get("target_table"))
+            out.append(ds)
+        return {"datasets": out}
+    finally:
+        conn.close()
+
+
+@app.post("/api/datasets")
+def create_dataset(body: DatasetBody):
+    """Register a generic dataset. target_table defaults to hub.ds_<name>."""
+    name = _validate_dataset(body)
+    target_table = f"{config.HUB_DB}.ds_{name}"
+    conn = _hub_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO datasets
+               (name, description, source_pattern, target_table, delimiter,
+                has_header, column_map, key_columns)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (name, body.description or "", body.source_pattern.strip(),
+             target_table, body.delimiter, int(body.has_header or 1),
+             json.dumps(body.column_map) if body.column_map is not None else None,
+             json.dumps(body.key_columns) if body.key_columns is not None else None),
+        )
+        conn.commit()
+    except mysql.connector.IntegrityError:
+        raise HTTPException(409, f"dataset {name!r} already exists")
+    finally:
+        conn.close()
+    return _get_dataset(name)
+
+
+@app.delete("/api/datasets/{name}")
+def deactivate_dataset(name: str):
+    """Deactivate a dataset (rows kept); the watcher stops claiming its files."""
+    conn = _hub_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE datasets SET is_active=0 WHERE name=%s", (name,))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, f"dataset {name!r} not found")
+    finally:
+        conn.close()
+    return {"name": name, "is_active": 0}
+
+
+@app.get("/api/datasets/{name}/preview")
+def dataset_preview(name: str, limit: int = Query(50, le=500)):
+    """Latest rows from the dataset's target table (newest first)."""
+    ds = _get_dataset(name)
+    ttable = ds.get("target_table")
+    if not ttable or not _QUALIFIED_TABLE_RE.match(str(ttable)):
+        raise HTTPException(500, f"dataset {name!r} has a bad target_table {ttable!r}")
+    conn = _hub_conn()
+    try:
+        cur = conn.cursor(dictionary=True)
+        try:
+            cur.execute(
+                f"SELECT * FROM {_qualify(ttable)} ORDER BY id DESC LIMIT %s", (limit,)
+            )
+            rows = cur.fetchall()
+        except mysql.connector.Error:
+            rows = []  # target table not created yet (no import yet)
+    finally:
+        conn.close()
+    return {"dataset": name, "target_table": ttable, "count": len(rows), "rows": rows}
 
 
 # --- phase 2 (categorization) -------------------------------------------------
