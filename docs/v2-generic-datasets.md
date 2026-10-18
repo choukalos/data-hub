@@ -1,13 +1,23 @@
 # v2 design: generic dataset ETL + mcp_datahub
 
-Status: v2a implemented (2026-10-18; production E2E pending `hub` db
-provisioning — `provision.sh` needs root; unit tests + scratch-MySQL E2E
-passed). v2b (mcp_datahub) implemented 2026-10-18 (10 tools, MCP handshake
-+ read-only tool calls verified; ingest_file verified with a scratch file).
-Both pending the `hub` db provisioning + data-hub restart for the full
-production E2E.
-Implements the v2 items from ARCHITECTURE.md sections 9/10:
-(1) generic-dataset ETL adapter, (2) MCP wrapper for data-hub.
+Status: **v2a + v2b implemented and production-E2E-verified (2026-10-18).**
+Unit tests green in-container (19 generic_csv + 5 hub_schema + 1
+table-regex). Production E2E 2026-10-18: `hub` db provisioned
+(provision.sh), data-hub restart applied hub migration 0001; scratch
+dataset verified end-to-end (register → watcher ingest 3 new → re-drop
+0 new / 3 updated → changed file 1 new / 2 updated → `hub.load_log` +
+`/api/loads?db=hub` + preview → cleanup); mcp_datahub `ingest_file`
+verified with a real hub load (hub.load_log id 10, 3 new, status ok) and
+`list_loads` / `list_datasets` / `dataset_preview` verified over live
+SSE. The E2E caught and fixed one real bug: `_QUALIFIED_TABLE_RE`
+rejected hyphenated table names (row_count 0 / preview 500 for
+datasets like `mcp-e2e`) — fixed in d8bc9d3; post-fix re-verified
+2026-10-18 23:21 UTC (`final-check` scratch dataset: ingest 3 new →
+re-drop 0 new / 3 updated → `row_count`=3 and `preview` HTTP 200 on the
+hyphenated table `hub.ds_final-check`; cleaned up). Known quirk (pre-existing,
+idempotent, v1-consistent): `ingest_file` uploads re-enter the watched
+inbox, so the original file is re-ingested by the watcher ~10 s later
+(0 new / N updated; two load_log rows, no data corruption).
 
 ## v2a — Generic dataset adapter (data-hub)
 
@@ -85,11 +95,18 @@ over generic data.
 ### Tests / verification
 
 - Unit: inference (int/float/date/str/empty), hash with/without keys,
-  delimiter, header off.
-- E2E: register a scratch dataset, drop a CSV into the inbox, watch the
-  watcher ingest it, re-drop the same file (0 new / N updated), drop a
-  changed file (updated), verify `hub.load_log` + `/api/loads?db=hub` +
-  preview endpoint. Clean up scratch dataset + table after.
+  delimiter, header off. (19 tests, `tests/test_generic_csv.py`; plus
+  `tests/test_hub_schema.py` 5 tests for the unmigrated-hub 503 guard and
+  `tests/test_dataset_table_re.py` 1 regression for hyphenated tables.)
+- E2E (done 2026-10-18): register a scratch dataset, drop a CSV into the
+  inbox, watch the watcher ingest it, re-drop the same file (0 new / N
+  updated), drop a changed file (updated), verify `hub.load_log` +
+  `/api/loads?db=hub` + preview endpoint. Clean up scratch dataset +
+  table after. — verified with `e2e-scratch` (loads 1–4 era) and
+  `mcp-e2e` (loads 8–15); scratch tables dropped, datasets deactivated.
+- MCP E2E (done 2026-10-18): over live SSE, `ingest_file` landed a real
+  hub load (not pending), `list_loads(db="hub")` / `list_datasets()` /
+  `dataset_preview()` all saw it.
 
 ## v2b — mcp_datahub (MCP server)
 
