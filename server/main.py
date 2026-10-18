@@ -154,7 +154,11 @@ def sources():
 
 _DATASET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _MYSQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_QUALIFIED_TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+# Qualified table 'db.tbl'. Both parts may contain hyphens: dataset slugs
+# allow '-', so default target tables look like hub.ds_mcp-e2e. Safe to
+# interpolate because _qualify() backticks both parts (backticks themselves
+# are rejected here).
+_QUALIFIED_TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\.[A-Za-z_][A-Za-z0-9_-]*$")
 
 
 class DatasetBody(BaseModel):
