@@ -1,0 +1,91 @@
+name: Deploy to Homelab
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build and Restart Service
+        run: |
+          set -e
+
+          # --- Serialized deploys ---------------------------------------------
+          # Thor can only build one tool at a time. Take an exclusive lock on a
+          # file shared by all deploy runners (the host /tmp/runner dir is
+          # mounted into every runner container). Wait up to 30 min for a slot.
+          # The lock is held until this step's shell exits.
+          LOCK=/tmp/runner/.thor-deploy.lock
+          exec 200>"$LOCK"
+          if ! flock -w 1800 200; then
+            echo "::error::Timed out waiting 30m for the thor deploy lock"
+            exit 1
+          fi
+          echo "Deploy lock acquired"
+
+          cd /home/github-runner/work/compose
+
+          # Source the .env so Docker Compose can resolve ${...} variables
+          # (DH_APP_USER, DH_APP_PASS, ...) in the compose file.
+          set -a
+          source ../.env
+          set +a
+
+          # Point the build context at the checkout (not the local copy).
+          # /tmp/runner is volume-mounted on the host, so Docker can resolve it.
+          WORKSPACE=${GITHUB_WORKSPACE}  # /tmp/runner/work-data/data-hub/data-hub
+
+          # Build from the newly checked-out code. We use a temporary compose
+          # copy so the build context points at the checkout; it lives under
+          # /tmp/runner (host-mounted) so Docker can resolve the path.
+          cp compose.data-hub.yml /tmp/runner/data-hub-ci.yml
+
+          # Guard: the sed below depends on an exact anchor string in the
+          # compose file — a cross-repo contract (compose file lives in the
+          # homelab repo, this workflow in the data-hub repo). If the anchors
+          # drift, sed silently no-ops and the build fails on a dangling
+          # context. Fail loudly instead.
+          grep -q 'context: /home/chuck/workspace/code/data-hub' /tmp/runner/data-hub-ci.yml || {
+            echo "::error::data-hub sed anchor missing from compose.data-hub.yml — deploy contract broken"
+            exit 1
+          }
+
+          sed -i "s|context: /home/chuck/workspace/code/data-hub|context: ${WORKSPACE}|" /tmp/runner/data-hub-ci.yml
+
+          # Verify the rewrite actually took effect (defense in depth).
+          grep -q "context: ${WORKSPACE}" /tmp/runner/data-hub-ci.yml || {
+            echo "::error::data-hub context rewrite did not take effect"
+            exit 1
+          }
+
+          # Build the image from the newly checked-out code.
+          docker compose -f /tmp/runner/data-hub-ci.yml build data-hub
+
+          # Restart with the original compose file so env_file: ../.env and
+          # the absolute port bindings resolve. --no-build prevents a rebuild
+          # from the stale local context paths.
+          docker compose -f compose.data-hub.yml up -d --no-build data-hub
+
+          # Wait for the API to be healthy (port is bound to the host LAN IP).
+          echo "Waiting for data-hub to become ready..."
+          for i in $(seq 1 30); do
+            state=$(docker inspect data-hub --format='{{.State.Status}}' 2>/dev/null || echo missing)
+            if [ "$state" = "running" ] && curl -sf -m 3 http://192.168.4.54:8100/api/health | grep -q '"status":"ok"'; then
+              echo "data-hub is healthy after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: data-hub not healthy in 30s — checking logs..."
+              docker logs --tail 50 data-hub
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "Deploy complete!"
