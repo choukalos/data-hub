@@ -124,6 +124,11 @@ def ingest_file(conn, path: str, adapter) -> dict:
         for r in result.rows:
             cid = cat_ids.get((r.parent_category, r.category or r.parent_category))
             h = _txn_hash(acct_ids[r.account_name], r)
+            # NOTE: category_id is only set on INSERT, never overwritten on
+            # re-import — manual tags (Car Purchase, Kids Allowance, College
+            # Living, ...) and rule/AI assignments must survive re-loads of
+            # exports that still carry the original CSV categories. Only
+            # brand-new (NULL) rows take the CSV's category.
             cur.execute(
                 """INSERT INTO transactions
                    (account_id, txn_date, amount_cents, payee, description,
@@ -131,7 +136,7 @@ def ingest_file(conn, path: str, adapter) -> dict:
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                    ON DUPLICATE KEY UPDATE
                      description = VALUES(description),
-                     category_id = VALUES(category_id),
+                     category_id = IF(category_id IS NULL, VALUES(category_id), category_id),
                      source_file = VALUES(source_file)""",
                 (acct_ids[r.account_name], r.txn_date, r.amount_cents, r.payee,
                  r.original_description, cid, h, filename),
