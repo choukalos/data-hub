@@ -16,7 +16,7 @@ import hashlib
 import json
 import os
 
-from .. import config
+from .. import config, manual
 from ..adapters.base import NormalizedTxn
 from ..adapters.generic_csv import parse_column_map, safe_column_name, split_entry
 
@@ -121,23 +121,29 @@ def ingest_file(conn, path: str, adapter) -> dict:
     if adapter.name == "starone_csv":
         acct_ids = _upsert_accounts(cur, result.accounts)
         cat_ids = _upsert_categories(cur, result.rows)
+        # v2b: re-import protection — fields manually edited (manual_edits
+        # audit table) are excluded from the ON DUPLICATE KEY UPDATE clause
+        # for that row; everything else refreshes from the export.
+        hashes = [_txn_hash(acct_ids[r.account_name], r) for r in result.rows]
+        id_by_hash = {}
+        if hashes:
+            ph = ", ".join(["%s"] * len(hashes))
+            cur.execute(f"SELECT id, content_hash FROM transactions "
+                        f"WHERE content_hash IN ({ph})", hashes)
+            for _row in cur.fetchall():
+                id_by_hash[_row[1]] = _row[0]
+        locked = manual.locked_fields(cur, "transactions",
+                                      [id_by_hash[h] for h in hashes if h in id_by_hash])
         for r in result.rows:
             cid = cat_ids.get((r.parent_category, r.category or r.parent_category))
             h = _txn_hash(acct_ids[r.account_name], r)
-            # NOTE: category_id is only set on INSERT, never overwritten on
-            # re-import — manual tags (Car Purchase, Kids Allowance, College
-            # Living, ...) and rule/AI assignments must survive re-loads of
-            # exports that still carry the original CSV categories. Only
-            # brand-new (NULL) rows take the CSV's category.
+            clause = manual.txn_upsert_clause(locked.get(id_by_hash.get(h), ()))
             cur.execute(
-                """INSERT INTO transactions
+                f"""INSERT INTO transactions
                    (account_id, txn_date, amount_cents, payee, description,
                     category_id, content_hash, source_file)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                   ON DUPLICATE KEY UPDATE
-                     description = VALUES(description),
-                     category_id = IF(category_id IS NULL, VALUES(category_id), category_id),
-                     source_file = VALUES(source_file)""",
+                   ON DUPLICATE KEY UPDATE {clause}""",
                 (acct_ids[r.account_name], r.txn_date, r.amount_cents, r.payee,
                  r.original_description, cid, h, filename),
             )
@@ -151,17 +157,23 @@ def ingest_file(conn, path: str, adapter) -> dict:
             if date_max is None or r.txn_date > date_max:
                 date_max = r.txn_date
     elif adapter.name == "tax_xlsx":
+        # v2b: re-import protection (same as the transactions path)
+        years = [r["year"] for r in result.rows]
+        if years:
+            ph = ", ".join(["%s"] * len(years))
+            cur.execute(f"SELECT year FROM tax_years WHERE year IN ({ph})", years)
+            existing_years = {row[0] for row in cur.fetchall()}
+        else:
+            existing_years = set()
+        locked = manual.locked_fields(cur, "tax_years",
+                                      [y for y in years if y in existing_years])
         for r in result.rows:
+            clause = manual.tax_upsert_clause(locked.get(r["year"], ()))
             cur.execute(
-                """INSERT INTO tax_years
+                f"""INSERT INTO tax_years
                    (year, income_cents, income_tax_paid_cents, savings_est_cents, savings_rate, notes)
                    VALUES (%s, %s, %s, %s, %s, %s)
-                   ON DUPLICATE KEY UPDATE
-                     income_cents=VALUES(income_cents),
-                     income_tax_paid_cents=VALUES(income_tax_paid_cents),
-                     savings_est_cents=VALUES(savings_est_cents),
-                     savings_rate=VALUES(savings_rate),
-                     notes=VALUES(notes)""",
+                   ON DUPLICATE KEY UPDATE {clause}""",
                 (r["year"], r["income_cents"], r["income_tax_paid_cents"],
                  r["savings_est_cents"], r["savings_rate"], r["notes"]),
             )
@@ -273,12 +285,28 @@ def upsert_dataset_rows(conn, dataset, rows, column_map=None, *,
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
             )
             ins_cols = ", ".join(f"`{t}`" for t in tcols)
-            sql = (f"INSERT INTO {qtable} (content_hash, {ins_cols}) "
-                   f"VALUES ({', '.join(['%s'] * (len(tcols) + 1))}) "
-                   f"ON DUPLICATE KEY UPDATE "
-                   + ", ".join(f"`{t}`=VALUES(`{t}`)" for t in tcols))
+            ins_sql = (f"INSERT INTO {qtable} (content_hash, {ins_cols}) "
+                       f"VALUES ({', '.join(['%s'] * (len(tcols) + 1))}) "
+                       f"ON DUPLICATE KEY UPDATE ")
+            # v2b: re-import protection — manually edited fields are kept
+            if rows:
+                ph = ", ".join(["%s"] * len(rows))
+                cur.execute(f"SELECT id, content_hash FROM {qtable} "
+                            f"WHERE content_hash IN ({ph})",
+                            [r.content_hash for r in rows])
+                id_by_hash = {row[1]: row[0] for row in cur.fetchall()}
+            else:
+                id_by_hash = {}
+            bare_table = str(target_table).split(".")[-1]
+            locked = manual.locked_fields(
+                cur, bare_table,
+                [id_by_hash.get(r.content_hash) for r in rows
+                 if r.content_hash in id_by_hash])
             for r in rows:
-                cur.execute(sql, [r.content_hash] + [r.values.get(t) for t in tcols])
+                clause = manual.ds_upsert_clause(
+                    tcols, locked.get(id_by_hash.get(r.content_hash), ()))
+                cur.execute(ins_sql + clause,
+                            [r.content_hash] + [r.values.get(t) for t in tcols])
                 rc = cur.rowcount  # 1=inserted, 2=changed, 0=matched unchanged
                 if rc == 1:
                     rows_new += 1

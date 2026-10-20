@@ -9,7 +9,7 @@ import mysql.connector
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
-from . import categorize, config, db, ingest
+from . import categorize, config, db, ingest, manual
 from .adapters.generic_csv import RESERVED_COLS, split_entry
 from .etl.pipeline import _qualify, hub_schema_ready
 
@@ -404,5 +404,135 @@ def review_suggestion(body: ReviewBody):
         raise HTTPException(404, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
+    finally:
+        conn.close()
+
+
+# --- v2b: manual row edits (audited, re-import protected) ----------------------
+
+class RowEditBody(BaseModel):
+    fields: dict
+    reason: Optional[str] = ""
+
+
+class RowInsertBody(BaseModel):
+    fields: dict
+    reason: Optional[str] = ""
+
+
+class BulkEditBody(BaseModel):
+    where: dict
+    set: dict
+    reason: str
+
+
+class RowDeleteBody(BaseModel):
+    reason: Optional[str] = ""
+
+
+_TABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _check_db(db_name: str):
+    if db_name not in (config.FINANCE_DB, config.HUB_DB):
+        raise HTTPException(400, f"db must be {config.FINANCE_DB!r} or {config.HUB_DB!r}")
+
+
+def _check_table(table: str):
+    if not _TABLE_NAME_RE.match(table):
+        raise HTTPException(400, "invalid table name")
+
+
+def _edit_conn(db_name: str):
+    # hub goes through _hub_conn() so an un-migrated hub degrades to 503
+    return _hub_conn() if db_name == config.HUB_DB else db.get_conn(config.FINANCE_DB)
+
+
+@app.get("/api/tables")
+def list_tables():
+    """Manual-edit registry: which tables/fields can be edited via /api/tables."""
+    return manual.list_tables()
+
+
+@app.patch("/api/tables/{db_name}/{table}/rows/{row_id}")
+def patch_row(db_name: str, table: str, row_id: int, body: RowEditBody):
+    """Set whitelisted fields on one row (row_id = the table's primary key).
+
+    Audited in manual_edits; edited fields are then protected from re-imports.
+    """
+    _check_db(db_name)
+    _check_table(table)
+    conn = _edit_conn(db_name)
+    try:
+        return manual.patch_row(conn, db_name, table, row_id, body.fields, body.reason)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/api/tables/{db_name}/{table}/rows")
+def insert_manual_row(db_name: str, table: str, body: RowInsertBody):
+    """Insert a manual row (source_file='manual' where the column exists)."""
+    _check_db(db_name)
+    _check_table(table)
+    conn = _edit_conn(db_name)
+    try:
+        return manual.insert_row(conn, db_name, table, body.fields, body.reason)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        conn.close()
+
+
+@app.delete("/api/tables/{db_name}/{table}/rows/{row_id}")
+def delete_row(db_name: str, table: str, row_id: int,
+               force: bool = Query(False), body: Optional[RowDeleteBody] = None):
+    """Delete a row. Manual rows by default; imported rows need ?force=true."""
+    _check_db(db_name)
+    _check_table(table)
+    conn = _edit_conn(db_name)
+    try:
+        return manual.delete_row(conn, db_name, table, row_id,
+                                 body.reason if body else "", force)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/api/tables/{db_name}/{table}/rows/bulk")
+def bulk_edit(db_name: str, table: str, body: BulkEditBody):
+    """Set fields on every row matching `where` (equality map, cap 5000 rows)."""
+    _check_db(db_name)
+    _check_table(table)
+    conn = _edit_conn(db_name)
+    try:
+        return manual.bulk_update(conn, db_name, table, body.where, body.set, body.reason)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/api/tables/{db_name}/{table}/edits")
+def table_edits(db_name: str, table: str, row_id: Optional[int] = None,
+                limit: int = Query(100, le=1000)):
+    """Audit trail of manual edits (newest first)."""
+    _check_db(db_name)
+    _check_table(table)
+    conn = _edit_conn(db_name)
+    try:
+        return manual.list_edits(conn, db_name, table, row_id, limit)
     finally:
         conn.close()
